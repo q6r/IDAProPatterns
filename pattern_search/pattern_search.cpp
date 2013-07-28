@@ -16,13 +16,25 @@
 #define PATTERN_MAX 20280
 #define PATTERN_NOT_FOUND -1
 
+typedef std::map<ea_t, ea_t> range_t;
+typedef std::map<ea_t, int> result_t;
+
 static std::vector<std::string> split(const std::string& s, const char &seperator);
 static std::string idaapi pattern_create(const uval_t &size);
 static int idaapi pattern_offset(const ea_t &content);
 static pid_t idaapi askpid(void);
 static void idaapi run(int);
 static int idaapi init(void);
+static char * idaapi get_maps(const int &pid);
+static void idaapi find_writeable_ranges(char *maps, range_t &ranges);
+static void idaapi show_results(result_t result);
+static void idaapi search_writeable_memory(result_t &found, range_t ranges);
+void idaapi term(void);
+static int idaapi thread_search(void *ud);
 
+qthread_t children[2];
+int nchilds;
+static range_t wranges;
 static std::string pattern = pattern_create(PATTERN_MAX);
 
 /**
@@ -34,16 +46,22 @@ static const char wanted_hotkey[] = "";
 plugin_t PLUGIN =
 {
   IDP_INTERFACE_VERSION,
-  PLUGIN_UNL,           // plugin flags
+  0,           // plugin flags
   init,                 // initialize
-  NULL,                 // terminate. this pointer may be NULL.
+  term,                 // terminate. this pointer may be NULL.
   run,                  // invoke plugin
-  comment,              // long comment about the plugin
+  comment,              // ea_t comment about the plugin
   NULL,                 // multiline help about the plugin
   wanted_name,          // the preferred short name of the plugin
   wanted_hotkey         // the preferred hotkey to run the plugin
 };
 
+/**
+ * split a string with separator
+ * @param s the string to split
+ * @param separator
+ * @return splitted parts
+ */
 static std::vector<std::string> split(const std::string& s, const char &seperator)
 {
     std::vector<std::string> output;
@@ -141,65 +159,41 @@ static pid_t idaapi askpid(void)
 }
 
 /**
- * Run
+ * @param pid the process id
+ * @return content of /proc/pid/maps
  */
-static void idaapi run(int)
+static char * idaapi get_maps(const int &pid)
 {
-    pid_t pid = askpid();
+    FILE *maps_fd = NULL;
+    char *maps    = (char*)qalloc(QMAXPATH);
 
-    register_info_t *greg = NULL;
-    regval_t gval;
+    if(!maps)
+        return NULL;
 
-    register_info_t *esp = NULL;
-    regval_t espval;
+    qsnprintf(maps, QMAXPATH-1, "/proc/%d/maps", pid);
 
-    msg("#########################\n");
-    msg("# Cyclic pattern search #\n");
-    msg("#########################\n\n");
-
-    if(!dbg)
-    {
-        msg("Can't search no debugger is loaded\n");
-        return;
-    }
-
-    for(int i=0;i< dbg->registers_size;i++)
-    {
-        greg = (dbg->registers+i);
-        // Get value in register
-        get_reg_val(greg->name, &gval);
-        if(!stricmp(greg->name, "ESP"))
-        {
-            esp    = greg;
-            espval = gval;
-        }
-        // Search if register contain cyclic pattern
-        int offset = pattern_offset(gval.ival);
-        if(offset != PATTERN_NOT_FOUND) 
-        {
-            msg("Found pattern in %s offset %d\n", greg->name, offset);
-        }
-    }
-
-    // Search for stack.
-    if(!esp)
-        return;
-    char maps[QMAXPATH];
-    qsnprintf(maps, sizeof(maps), "/proc/%u/maps", pid);
-    FILE *maps_fd = qfopen(maps, "r");
-    if(maps_fd == NULL) {
-        msg("Unable to open file\n");
-        return;
-    }
-    qfread(maps_fd, maps, sizeof(maps));
+    maps_fd = qfopen(maps, "r");
+    if(maps_fd == NULL)
+        return NULL;
+    
+    qfread(maps_fd, maps, QMAXPATH-1);
     qfclose(maps_fd);
 
-    // find writeable memory ranges for /proc/PID/maps
-    std::map<long, long> wranges;
+    return maps;
+}
+
+/**
+ * Get the writeable ranges
+ * @param maps the content of /proc/pid/maps
+ * @param ranges the writeable ranges
+ */
+static void idaapi find_writeable_ranges(char *maps, range_t &ranges)
+{
     std::vector<std::string> splits;
     std::stringstream ss(maps);
     std::string line;
     int current = 0;
+
     while(std::getline(ss, line, ' '))
     {
         splits.push_back(line);
@@ -210,7 +204,7 @@ static void idaapi run(int)
                 std::string fromto = split(splits.at(current-1), '\n')[1];
                 std::string from   = split(fromto, '-')[0];
                 std::string to     = split(fromto, '-')[1];
-                wranges.insert( std::pair<long, long>(
+                ranges.insert( std::pair<ea_t, ea_t>(
                             strtoul(from.c_str(), NULL,16),
                             strtoul(to.c_str(), NULL, 16)
                             ));
@@ -219,18 +213,38 @@ static void idaapi run(int)
         current++;
     }
 
-    // searching in writeable ranges for patterns
-    msg("Searching in writeable memory :\n");
-    std::map<ea_t, int> found; // addr, offset
+}
 
-    for(std::map<long, long>::iterator it= wranges.begin();
-            it!=wranges.end();
+/**
+ * Show results
+ * @param result contains address->offset
+ */
+static void idaapi show_results(result_t result)
+{
+    for(result_t::iterator it=result.begin();
+            it!=result.end();
+            it++)
+    {
+        ea_t address = it->first;
+        int offset   = it->second;
+        msg("Found at %p offset %d\n", address, offset);
+    }
+}
+
+/**
+ * Search writeable memories for patterns
+ * @param found found address that contain pattern
+ * @param ranges the ranges to serch in <from, to>
+ */
+static void idaapi search_writeable_memory(result_t &found, range_t ranges)
+{
+    for(range_t::iterator it= ranges.begin();
+            it!=ranges.end();
             it++)
     {
         msg("%p to %p\n", it->first, it->second);
         ea_t start = it->first;
         ea_t end   = it->second;
-        int previous_offset = 0;
 
         while(start < end-4)
         {
@@ -253,20 +267,103 @@ static void idaapi run(int)
             start++;
         }
     }
+}
+
+/**
+ * Run pattern search thread
+ */
+static int idaapi thread_search(void *ud)
+{
+    result_t found;
+    msg("Searching in writeable memory :\n");
+    search_writeable_memory(found, wranges);
 
     // preview found patterns
     msg("Results :\n");
-    for(std::map<ea_t, int>::iterator it=found.begin();
-            it!=found.end();
-            it++)
+    show_results(found);
+    term();
+#ifdef __GNUC__
+    return 0;
+#endif
+}
+
+/**
+ * Terminate
+ */
+void idaapi term(void)
+{
+    // kill threads
+    if(nchilds > 0)
     {
-        ea_t address = it->first;
-        int offset   = it->second;
-        msg("Found at %p offset %d\n", address, offset);
+        for(int i=0;i<nchilds;i++)
+        {
+            qthread_kill(children[i]);
+            qthread_join(children[i]);
+            qthread_free(children[i]);
+        }
+        nchilds = 0;
+    }
+}
+
+/**
+ * Run
+ */
+static void idaapi run(int)
+{
+
+    if(!dbg)
+    {
+        msg("Can't search no debugger is loaded\n");
+        return;
+    }
+
+    pid_t pid = askpid();
+
+    register_info_t *greg = NULL;
+    regval_t gval;
+    regval_t espval;
+
+    for(int i=0;i< dbg->registers_size;i++)
+    {
+        greg = (dbg->registers+i);
+        // Get value in register
+        get_reg_val(greg->name, &gval);
+        if(!stricmp(greg->name, "ESP"))
+        {
+            espval = gval;
+        }
+        // Search if register contain cyclic pattern
+        int offset = pattern_offset(gval.ival);
+        if(offset != PATTERN_NOT_FOUND) 
+        {
+            msg("Found pattern in %s offset %d\n", greg->name, offset);
+        }
+    }
+
+    // get /proc/pid/maps content
+    char *maps = get_maps(pid);
+    if(!maps)
+    {
+        msg("Unable to get maps\n");
+        return;
+    }
+
+    // find writeable memory ranges for /proc/PID/maps
+    find_writeable_ranges(maps, wranges);
+    qfree(maps);
+
+    if(nchilds != 0) // threads kill?
+        term();
+
+    // searching thread in writeable ranges for patterns
+    if(nchilds == 0)
+    {
+        children[nchilds] = qthread_create(thread_search, (void *)nchilds);
+        nchilds++;
     }
 }
 
 static int idaapi init(void)
 {
-    return PLUGIN_OK;
+    return PLUGIN_KEEP;
 }
